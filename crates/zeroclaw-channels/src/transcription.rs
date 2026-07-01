@@ -224,19 +224,51 @@ impl OpenAiWhisperProvider {
         alias: &str,
         config: &zeroclaw_config::schema::OpenAiSttConfig,
     ) -> Result<Self> {
-        let api_key = config
+        // 1. 显式配置字段优先
+        if let Some(api_key) = config
             .api_key
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .map(ToOwned::to_owned)
-            .context("Missing OpenAI STT API key: set [transcription.openai].api_key")?;
+        {
+            return Ok(Self {
+                alias: alias.to_string(),
+                api_key: api_key.to_string(),
+                model: config.model.clone(),
+            });
+        }
 
-        Ok(Self {
-            alias: alias.to_string(),
-            api_key,
-            model: config.model.clone(),
-        })
+        // 2. 环境变量回退: TRANSCRIPTION_API_KEY (专用)
+        if let Ok(key) = std::env::var("TRANSCRIPTION_API_KEY") {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                return Ok(Self {
+                    alias: alias.to_string(),
+                    api_key: trimmed.to_string(),
+                    model: config.model.clone(),
+                });
+            }
+        }
+
+        // 3. 环境变量回退: OPENAI_API_KEY (通用)
+        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                return Ok(Self {
+                    alias: alias.to_string(),
+                    api_key: trimmed.to_string(),
+                    model: config.model.clone(),
+                });
+            }
+        }
+
+        // 4. 全部失败
+        anyhow::bail!(
+            "Missing OpenAI STT API key. Set either:\n\
+             • [transcription.openai].api_key in config.toml\n\
+             • TRANSCRIPTION_API_KEY environment variable\n\
+             • OPENAI_API_KEY environment variable"
+        );
     }
 
     /// Build from a typed `[providers.transcription.openai.<alias>]` entry.
@@ -244,23 +276,53 @@ impl OpenAiWhisperProvider {
         alias: &str,
         cfg: &zeroclaw_config::schema::OpenAiTranscriptionProviderConfig,
     ) -> Result<Self> {
-        let api_key = cfg
+        // 1. 显式配置字段优先
+        if let Some(api_key) = cfg
             .base
             .api_key
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                anyhow::Error::msg(format!(
-                    "Missing API key for [providers.transcription.openai.{alias}]"
-                ))
-            })?;
-        Ok(Self {
-            alias: alias.to_string(),
-            api_key,
-            model: cfg.model.clone().unwrap_or_else(|| "whisper-1".to_string()),
-        })
+        {
+            return Ok(Self {
+                alias: alias.to_string(),
+                api_key: api_key.to_string(),
+                model: cfg.model.clone().unwrap_or_else(|| "whisper-1".to_string()),
+            });
+        }
+
+        // 2. 环境变量回退: TRANSCRIPTION_API_KEY
+        if let Ok(key) = std::env::var("TRANSCRIPTION_API_KEY") {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                return Ok(Self {
+                    alias: alias.to_string(),
+                    api_key: trimmed.to_string(),
+                    model: cfg.model.clone().unwrap_or_else(|| "whisper-1".to_string()),
+                });
+            }
+        }
+
+        // 3. 环境变量回退: OPENAI_API_KEY
+        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                return Ok(Self {
+                    alias: alias.to_string(),
+                    api_key: trimmed.to_string(),
+                    model: cfg.model.clone().unwrap_or_else(|| "whisper-1".to_string()),
+                });
+            }
+        }
+
+        // 4. 全部失败
+        anyhow::bail!(
+            "Missing OpenAI STT API key for [providers.transcription.openai.{}]. Set either:\n\
+             • base.api_key in config\n\
+             • TRANSCRIPTION_API_KEY environment variable\n\
+             • OPENAI_API_KEY environment variable",
+            alias
+        );
     }
 }
 
@@ -2064,5 +2126,151 @@ mod tests {
             !err.contains("no transcription_provider configured"),
             "dotted alias must resolve; got: {err}"
         );
+    }
+
+    #[cfg(test)]
+    mod openai_stt_env_tests {
+        use super::*;
+
+        #[test]
+        fn test_from_config_uses_explicit_api_key() {
+            let config = OpenAiSttConfig {
+                api_key: Some("sk-explicit".to_string()),
+                model: "whisper-1".to_string(),
+            };
+            let provider = OpenAiWhisperProvider::from_config("test", &config).unwrap();
+            assert_eq!(provider.api_key, "sk-explicit");
+        }
+
+        #[test]
+        fn test_from_config_uses_transcription_api_key_env() {
+            // SAFETY: tests are single-threaded; env var isolation is acceptable
+            unsafe { std::env::set_var("TRANSCRIPTION_API_KEY", "sk-transcript") };
+            let config = OpenAiSttConfig {
+                api_key: None,
+                model: "whisper-1".to_string(),
+            };
+            let provider = OpenAiWhisperProvider::from_config("test", &config).unwrap();
+            assert_eq!(provider.api_key, "sk-transcript");
+            unsafe { std::env::remove_var("TRANSCRIPTION_API_KEY") };
+        }
+
+        #[test]
+        fn test_from_config_uses_openai_api_key_env() {
+            // SAFETY: tests are single-threaded; env var isolation is acceptable
+            unsafe { std::env::set_var("OPENAI_API_KEY", "sk-openai") };
+            let config = OpenAiSttConfig {
+                api_key: None,
+                model: "whisper-1".to_string(),
+            };
+            let provider = OpenAiWhisperProvider::from_config("test", &config).unwrap();
+            assert_eq!(provider.api_key, "sk-openai");
+            unsafe { std::env::remove_var("OPENAI_API_KEY") };
+        }
+
+        #[test]
+        fn test_from_config_fails_with_no_credentials() {
+            let config = OpenAiSttConfig {
+                api_key: None,
+                model: "whisper-1".to_string(),
+            };
+            // Ensure no env vars are set
+            // SAFETY: tests are single-threaded; env var isolation is acceptable
+            unsafe { std::env::remove_var("TRANSCRIPTION_API_KEY") };
+            unsafe { std::env::remove_var("OPENAI_API_KEY") };
+            assert!(OpenAiWhisperProvider::from_config("test", &config).is_err());
+        }
+
+        #[test]
+        fn test_priority_explicit_over_env() {
+            // SAFETY: tests are single-threaded; env var isolation is acceptable
+            unsafe { std::env::set_var("OPENAI_API_KEY", "sk-env") };
+            let config = OpenAiSttConfig {
+                api_key: Some("sk-explicit".to_string()),
+                model: "whisper-1".to_string(),
+            };
+            let provider = OpenAiWhisperProvider::from_config("test", &config).unwrap();
+            assert_eq!(provider.api_key, "sk-explicit"); // explicit wins
+            unsafe { std::env::remove_var("OPENAI_API_KEY") };
+        }
+
+        #[test]
+        fn test_transcription_over_openai_env_priority() {
+            // SAFETY: tests are single-threaded; env var isolation is acceptable
+            unsafe { std::env::set_var("TRANSCRIPTION_API_KEY", "sk-transcript") };
+            unsafe { std::env::set_var("OPENAI_API_KEY", "sk-openai") };
+            let config = OpenAiSttConfig {
+                api_key: None,
+                model: "whisper-1".to_string(),
+            };
+            let provider = OpenAiWhisperProvider::from_config("test", &config).unwrap();
+            assert_eq!(provider.api_key, "sk-transcript"); // TRANSCRIPTION wins
+            unsafe { std::env::remove_var("TRANSCRIPTION_API_KEY") };
+            unsafe { std::env::remove_var("OPENAI_API_KEY") };
+        }
+
+        #[test]
+        fn test_from_typed_config_uses_explicit_api_key() {
+            let cfg = zeroclaw_config::schema::OpenAiTranscriptionProviderConfig {
+                base: zeroclaw_config::schema::TranscriptionProviderConfig {
+                    api_key: Some("sk-explicit".to_string()),
+                    language: None,
+                    initial_prompt: None,
+                },
+                model: Some("whisper-1".to_string()),
+            };
+            let provider = OpenAiWhisperProvider::from_typed_config("test", &cfg).unwrap();
+            assert_eq!(provider.api_key, "sk-explicit");
+        }
+
+        #[test]
+        fn test_from_typed_config_uses_transcription_api_key_env() {
+            // SAFETY: tests are single-threaded; env var isolation is acceptable
+            unsafe { std::env::set_var("TRANSCRIPTION_API_KEY", "sk-transcript") };
+            let cfg = zeroclaw_config::schema::OpenAiTranscriptionProviderConfig {
+                base: zeroclaw_config::schema::TranscriptionProviderConfig {
+                    api_key: None,
+                    language: None,
+                    initial_prompt: None,
+                },
+                model: Some("whisper-1".to_string()),
+            };
+            let provider = OpenAiWhisperProvider::from_typed_config("test", &cfg).unwrap();
+            assert_eq!(provider.api_key, "sk-transcript");
+            unsafe { std::env::remove_var("TRANSCRIPTION_API_KEY") };
+        }
+
+        #[test]
+        fn test_from_typed_config_uses_openai_api_key_env() {
+            // SAFETY: tests are single-threaded; env var isolation is acceptable
+            unsafe { std::env::set_var("OPENAI_API_KEY", "sk-openai") };
+            let cfg = zeroclaw_config::schema::OpenAiTranscriptionProviderConfig {
+                base: zeroclaw_config::schema::TranscriptionProviderConfig {
+                    api_key: None,
+                    language: None,
+                    initial_prompt: None,
+                },
+                model: Some("whisper-1".to_string()),
+            };
+            let provider = OpenAiWhisperProvider::from_typed_config("test", &cfg).unwrap();
+            assert_eq!(provider.api_key, "sk-openai");
+            unsafe { std::env::remove_var("OPENAI_API_KEY") };
+        }
+
+        #[test]
+        fn test_from_typed_config_fails_with_no_credentials() {
+            // SAFETY: tests are single-threaded; env var isolation is acceptable
+            unsafe { std::env::remove_var("TRANSCRIPTION_API_KEY") };
+            unsafe { std::env::remove_var("OPENAI_API_KEY") };
+            let cfg = zeroclaw_config::schema::OpenAiTranscriptionProviderConfig {
+                base: zeroclaw_config::schema::TranscriptionProviderConfig {
+                    api_key: None,
+                    language: None,
+                    initial_prompt: None,
+                },
+                model: Some("whisper-1".to_string()),
+            };
+            assert!(OpenAiWhisperProvider::from_typed_config("test", &cfg).is_err());
+        }
     }
 }
